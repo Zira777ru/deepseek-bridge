@@ -23,9 +23,12 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ds-bridge")
 
-OPENAI_KEY = os.environ["OPENAI_API_KEY"]
+GROQ_KEY = os.environ["GROQ_API_KEY"]
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+
+STT_MODEL = os.environ.get("STT_MODEL", "whisper-large-v3-turbo")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "deepseek-v4-flash")
 
 SYSTEM_PROMPT = (
     "You are an AI assistant displayed on Even G2 smart glasses (576x288 px, "
@@ -82,12 +85,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
     log.info("chat req: pcm=%dB wav=%dB sr=%d", len(pcm), len(wav), req.sample_rate)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # STT — OpenAI Whisper
+        # STT — Groq Whisper (OpenAI-compatible)
         stt_r = await client.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
             files={"file": ("audio.wav", wav, "audio/wav")},
-            data={"model": "whisper-1"},
+            data={"model": STT_MODEL},
         )
         if stt_r.status_code != 200:
             log.error("stt fail %s: %s", stt_r.status_code, stt_r.text[:200])
@@ -102,7 +105,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
             "https://api.deepseek.com/chat/completions",
             headers={"Authorization": f"Bearer {DEEPSEEK_KEY}"},
             json={
-                "model": "deepseek-chat",
+                "model": CHAT_MODEL,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": transcript},
