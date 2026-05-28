@@ -56,6 +56,15 @@ class ChatResponse(BaseModel):
     reply: str
 
 
+class SttRequest(BaseModel):
+    audio_base64: str
+    sample_rate: Optional[int] = 16000
+
+
+class SttResponse(BaseModel):
+    transcript: str
+
+
 def pcm_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
     block_align = channels * bits // 8
     byte_rate = sample_rate * block_align
@@ -123,6 +132,34 @@ async def chat(req: ChatRequest) -> ChatResponse:
         log.info("reply: %s", reply)
 
     return ChatResponse(transcript=transcript, reply=reply)
+
+
+@app.post("/stt", response_model=SttResponse)
+async def stt(req: SttRequest) -> SttResponse:
+    """STT-only: PCM → transcript. Used by claude-glasses (LLM is done elsewhere)."""
+    try:
+        pcm = base64.b64decode(req.audio_base64)
+    except Exception as e:
+        raise HTTPException(400, f"invalid base64: {e}")
+    if len(pcm) < 3200:
+        raise HTTPException(400, "audio too short (<0.1s)")
+
+    wav = pcm_to_wav(pcm, sample_rate=req.sample_rate or 16000)
+    log.info("stt req: pcm=%dB wav=%dB sr=%d", len(pcm), len(wav), req.sample_rate)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            files={"file": ("audio.wav", wav, "audio/wav")},
+            data={"model": STT_MODEL},
+        )
+        if r.status_code != 200:
+            log.error("stt fail %s: %s", r.status_code, r.text[:200])
+            raise HTTPException(502, f"stt failed: {r.status_code}")
+        transcript = (r.json().get("text") or "").strip()
+        log.info("stt: %s", transcript)
+    return SttResponse(transcript=transcript)
 
 
 @app.get("/healthz")
