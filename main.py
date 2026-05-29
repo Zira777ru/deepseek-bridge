@@ -25,10 +25,17 @@ log = logging.getLogger("ds-bridge")
 
 GROQ_KEY = os.environ["GROQ_API_KEY"]
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 STT_MODEL = os.environ.get("STT_MODEL", "whisper-large-v3-turbo")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "deepseek-v4-flash")
+# /stt (claude-glasses) uses Gemini, NOT Groq Whisper — Groq key was never provisioned.
+GEMINI_STT_MODEL = os.environ.get("GEMINI_STT_MODEL", "gemini-2.5-flash")
+STT_PROMPT = (
+    "Transcribe this audio verbatim. Output ONLY the transcript text — "
+    "no quotes, no commentary, no translation. If there is no speech, output nothing."
+)
 
 SYSTEM_PROMPT = (
     "You are an AI assistant displayed on Even G2 smart glasses (576x288 px, "
@@ -136,7 +143,13 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 @app.post("/stt", response_model=SttResponse)
 async def stt(req: SttRequest) -> SttResponse:
-    """STT-only: PCM → transcript. Used by claude-glasses (LLM is done elsewhere)."""
+    """STT-only: PCM → transcript. Used by claude-glasses (LLM is done elsewhere).
+
+    Backed by Gemini (audio understanding), not Groq Whisper — the Groq key was
+    never provisioned. PCM is wrapped in a WAV header and sent inline.
+    """
+    if not GEMINI_KEY:
+        raise HTTPException(503, "GEMINI_API_KEY not configured")
     try:
         pcm = base64.b64decode(req.audio_base64)
     except Exception as e:
@@ -145,19 +158,33 @@ async def stt(req: SttRequest) -> SttResponse:
         raise HTTPException(400, "audio too short (<0.1s)")
 
     wav = pcm_to_wav(pcm, sample_rate=req.sample_rate or 16000)
+    wav_b64 = base64.b64encode(wav).decode()
     log.info("stt req: pcm=%dB wav=%dB sr=%d", len(pcm), len(wav), req.sample_rate)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            files={"file": ("audio.wav", wav, "audio/wav")},
-            data={"model": STT_MODEL},
-        )
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_STT_MODEL}:generateContent?key={GEMINI_KEY}"
+    )
+    body = {
+        "contents": [{"parts": [
+            {"text": STT_PROMPT},
+            {"inline_data": {"mime_type": "audio/wav", "data": wav_b64}},
+        ]}],
+        # thinkingBudget=0 → no chain-of-thought, lowest latency for a transcription task
+        "generationConfig": {"temperature": 0, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=body)
         if r.status_code != 200:
             log.error("stt fail %s: %s", r.status_code, r.text[:200])
             raise HTTPException(502, f"stt failed: {r.status_code}")
-        transcript = (r.json().get("text") or "").strip()
+        data = r.json()
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+            transcript = "".join(p.get("text", "") for p in parts).strip()
+        except (KeyError, IndexError):
+            # No candidate (e.g. safety filter / empty audio) → treat as silence
+            transcript = ""
         log.info("stt: %s", transcript)
     return SttResponse(transcript=transcript)
 
